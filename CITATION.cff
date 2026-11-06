@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this software in education, research, or academic workshops, please cite it as below."
+title: "Adaptasia: An Educational Climate-Adaptation City Builder"
+abstract: "A browser-based educational serious game modeling compound climate hazards, nature-based solutions, gray infrastructure trade-offs, and urban resilience."
+type: software
+authors:
+  - name: "Adaptasia Contributors"
+repository-code: "https://github.com/adaptasia/adaptasia"
+keywords:
+  - "climate adaptation"
+  - "serious games"
+  - "urban planning"
+  - "nature-based solutions"
+  - "flood risk"
+  - "urban heat island"
+  - "resilience"
+license: "MIT"
+version: "0.1.0-beta"
+date-released: "2026-11-06"
