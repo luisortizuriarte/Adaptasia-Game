@@ -1,0 +1,1069 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Adaptasia (Beta)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  html,body{margin:0;height:100%;background:#0f0f1b;overflow:hidden}
+  body{display:flex;align-items:center;justify-content:center}
+  canvas{image-rendering:pixelated;image-rendering:crisp-edges;cursor:crosshair;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+'use strict';
+/* =====================================================================
+   ADAPTASIA (beta): an educational climate-adaptation city builder.
+   Single file, HTML5 Canvas + vanilla JS, no external assets.
+   Modules (in order): CONFIG, UTIL, MAP, SIMULATION, HAZARDS,
+   SPRITES, RENDER, UI, BOOT.
+   Tip: open with ?debug=1 in the URL (or set DEBUG = true) for test tools.
+   ===================================================================== */
+
+/* =====================================================================
+   MODULE: CONFIG  (all balancing numbers live here)
+   ===================================================================== */
+let DEBUG = false;   // true = tile values (E=elev top-left, heat bottom-right, flood risk bottom-left; V toggles) + FLOOD!/HEAT!/+10K buttons (keys F / H)
+try { if (/debug=1/.test(location.search)) DEBUG = true; } catch (e) {}
+
+const CONFIG = {
+  W: 640, H: 448, TILE: 16, COLS: 32, ROWS: 24, MAP_X: 124, MAP_Y: 30,
+  startBudget: 25000,
+  maxYears: 30,
+  winPop: 5000, winResilience: 70,
+  loseHappiness: 20, loseHappyYears: 3,
+  bankruptYears: 3,            // in the red at the end of this many years in a row = bankrupt
+  autoSeconds: 5,
+  hillCostMult: 1.5,           // zones/roads on hills cost more (but hills rarely flood)
+
+  econ:   { taxPerResident: 2.5, taxPerJob: 2, workerShare: 0.6 },
+  growth: { migrationBase: 150, migrationRate: 0.08, maxFactor: 1.0, shrink: 0.3, roadReach: 2 },
+
+  flood: {
+    baseChance: 0.30, chanceTrend: 0.015, maxChance: 0.75,   // yearly probability
+    sevMin: 0.4, sevRange: 0.6, sevTrend: 0.045,             // severity = (min + rnd*range) * (1 + trend*year)
+    extremeChance: 0.05, extremeTrend: 0.007, extremeMult: 1.5,   // extreme odds rise each year
+    levelBase: 0.05, levelPerSev: 0.22,                      // water level (elevation units) = base + per*severity
+    designSev: 1.0,                                          // "design flood" used for the risk map & resilience
+    damageDepth: 0.05,                                       // depth that counts as flooding a building
+    popLossPerDepth: 2.0,
+    abandonCount: 2, abandonWindow: 3,                       // floods twice in 3 years = abandoned
+    leveeSurge: 0.12,                                        // extra depth when a levee fails
+    nbsCap: 0.20,                                            // max flood reduction from nature on one tile (soil saturates)
+    grayCap: 0.20,                                           // max flood reduction from drains on one tile
+  },
+  heat: {
+    baseChance: 0.25, chanceTrend: 0.02, maxChance: 0.80,
+    intMin: 0.6, intRange: 0.4, intTrend: 0.03,
+    baseTile: 0.25, waterCool: 0.06,
+    harmThreshold: 0.40, harmK: 0.35,
+  },
+  resilience: { wProtected: 0.40, wHeat: 0.35, wAvoided: 0.25, heatLow: 0.35, heatHigh: 0.80 },
+
+  /* Item stats: cost, upkeep (per year), flood (reduction in depth; for levee = protection threshold),
+     heatRed (heat reduction; negative = adds heat), rec (recreation), attr (attractiveness),
+     mature (years to full effect), fail (failure chance in EXTREME events), radius (tiles),
+     lv (land-value boost), dmg ($ damage per 1.0 flood depth). */
+  items: {
+    inspect:  { name: 'Inspect',  cat: 'tool', cost: 0,
+                desc: 'Click a tile to see its details.' },
+    demolish: { name: 'Demolish', cat: 'tool', cost: 20,
+                desc: 'Clear a tile. Abandoned buildings must be cleared before rebuilding.' },
+
+    road: { name: 'Road', cat: 'dev', cost: 60, upkeep: 3, flood: 0, heatRed: -0.06, rec: 0, attr: 0, mature: 0, fail: 0, radius: 0, lv: 0, dmg: 500,
+            desc: 'Zones need a road within 2 tiles to grow.',
+            fact: 'Pavement absorbs the sun all day and releases heat at night, warming nearby blocks.' },
+    res:  { name: 'Residential', cat: 'dev', cost: 300, upkeep: 0, flood: 0, heatRed: -0.05, rec: 0, attr: 0, mature: 0, fail: 0, radius: 0, lv: 0, dmg: 2000, cap: 80,
+            desc: 'Homes. Every resident pays tax. Grows faster with jobs, parks and low risk.',
+            fact: 'Where we build matters: homes on high ground avoid most flood losses.' },
+    com:  { name: 'Commercial', cat: 'dev', cost: 400, upkeep: 0, flood: 0, heatRed: -0.08, rec: 0, attr: 0, mature: 0, fail: 0, radius: 0, lv: 0.02, dmg: 2500, jobs: 60,
+            desc: 'Shops and offices. Adds jobs and tax.',
+            fact: 'Jobs nearby draw new residents and keep people from leaving.' },
+
+    levee: { name: 'Levee/Seawall', cat: 'gray', cost: 3000, upkeep: 250, flood: 0.40, heatRed: -0.03, rec: 0, attr: -3, mature: 0, fail: 0.15, radius: 2, lv: -0.04, dmg: 0,
+             desc: 'Blocks floods within 2 tiles up to a set depth. Overtopped or breached in extreme floods.',
+             fact: "Levees can create a false sense of safety: building grows behind them, so a failure causes bigger losses (the 'levee effect')." },
+    drain: { name: 'Storm Drain', cat: 'gray', cost: 1500, upkeep: 80, flood: 0.10, heatRed: 0, rec: 0, attr: 0, mature: 0, fail: 0.25, radius: 3, lv: 0, dmg: 1000,
+             desc: 'Lowers flood depth within 3 tiles. Can clog in extreme storms.',
+             fact: 'Storm drains are sized for a design storm. Heavier downpours overwhelm them.' },
+    cool:  { name: 'Cooling Center', cat: 'gray', cost: 2000, upkeep: 150, flood: 0, heatRed: 0, rec: 0, attr: 1, mature: 0, fail: 0, radius: 4, lv: 0.01, dmg: 1000, harmCut: 0.6,
+             desc: 'Cuts heat-wave harm within 4 tiles by 60%. Does not lower temperatures.',
+             fact: 'Cooling centers save lives in heat waves, especially for older adults and people without air conditioning.' },
+
+    wetland: { name: 'Wetland', cat: 'nature', cost: 500, upkeep: 10, flood: 0.14, heatRed: 0.12, rec: 6, attr: 4, mature: 3, fail: 0, radius: 3, lv: 0.06, dmg: 0, only: 'flood',
+               desc: 'Floodplain tiles only. Soaks up floodwater within 3 tiles. Full effect after 3 years.',
+               fact: 'Wetlands work like sponges: one acre can store over a million gallons of floodwater.' },
+    park:    { name: 'Park/Trees', cat: 'nature', cost: 350, upkeep: 15, flood: 0.03, heatRed: 0.20, rec: 10, attr: 3, mature: 2, fail: 0, radius: 0, lv: 0.08, dmg: 0,
+               desc: 'Trees cool the area and add recreation and land value.',
+               fact: 'Shade trees can keep surfaces many degrees cooler than bare pavement.' },
+    roof:    { name: 'Green Roof', cat: 'nature', cost: 200, upkeep: 5, flood: 0.03, heatRed: 0.08, rec: 1, attr: 1, mature: 1, fail: 0, radius: 0, lv: 0.03, dmg: 0,
+               desc: 'Upgrade a zone: a little cooling, stormwater storage and happiness.',
+               fact: 'Green roofs soak up rainfall and stay much cooler than dark roofs in summer.' },
+    swale:   { name: 'Bioswale', cat: 'nature', cost: 120, upkeep: 3, flood: 0.05, heatRed: 0.03, rec: 1, attr: 1, mature: 1, fail: 0, radius: 1, lv: 0.02, dmg: 0,
+               desc: 'Cheap planted channel that soaks up runoff within 1 tile.',
+               fact: 'Bioswales slow and filter stormwater so it soaks into the ground instead of flooding streets.' },
+  },
+};
+
+/* Short educational facts used in events (15). */
+const FACTS = {
+  floodplain: "Floodplains are where rivers naturally spread out. Building there puts people in harm's way.",
+  downpours: 'Climate change is making heavy downpours more frequent and intense in many regions.',
+  mitigation: 'Studies of U.S. hazard mitigation find each $1 invested saves about $6 in future disaster costs, on average.',
+  neighbors: 'Seawalls and levees protect what is behind them but can push water and erosion onto neighbors.',
+  levee: CONFIG.items.levee.fact,
+  wetland: CONFIG.items.wetland.fact,
+  drain: CONFIG.items.drain.fact,
+  mature: 'Natural systems keep improving as they mature, while concrete slowly wears out.',
+  saturate: 'Soils and wetlands can only hold so much. In the largest floods they fill up and water passes through.',
+  heatDeadly: 'Heat is one of the deadliest weather hazards, often causing more deaths than floods or hurricanes.',
+  island: 'Paved surfaces and dark roofs make cities warmer than the countryside: the urban heat island effect.',
+  canopy: 'Tree canopy shades streets and cools the air as leaves release water.',
+  cooling: CONFIG.items.cool.fact,
+  greenroof: CONFIG.items.roof.fact,
+  inequity: 'The hottest neighborhoods are often the ones with the least tree cover.',
+};
+
+/* =====================================================================
+   MODULE: UTIL
+   ===================================================================== */
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const DIR4 = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+const idx = (x, y) => y * CONFIG.COLS + x;
+const inB = (x, y) => x >= 0 && y >= 0 && x < CONFIG.COLS && y < CONFIG.ROWS;
+const isWaterT = t => t.t === 'river' || t.t === 'sea';
+const fmt = n => (n < 0 ? '-' : '') + Math.abs(Math.round(n)).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+/** Visit every tile within Chebyshev radius r of (x,y): fn(index, distance, nx, ny) */
+function forRadius(x, y, r, fn) {
+  for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) {
+    const nx = x + dx, ny = y + dy;
+    if (inB(nx, ny)) fn(idx(nx, ny), Math.max(Math.abs(dx), Math.abs(dy)), nx, ny);
+  }
+}
+/** Maturity multiplier: 25% when new, 100% after item.mature years. */
+function eff(item, age) { return item.mature ? 0.25 + 0.75 * Math.min(1, age / item.mature) : 1; }
+
+/* =====================================================================
+   MODULE: MAP  (procedural terrain: coast, river, floodplain, hills)
+   ===================================================================== */
+function newTile() {
+  return { t: 'land', e: 0, v: 0, b: null, age: 0, pop: 0, jobs: 0, roof: false, roofAge: 0, ab: false,
+           fh: [], heat: 0, lv: 0, risk: 0, rawRisk: 0, cooled: 0, fx: 0, hx: 0, dmgYear: -9, scar: false };
+}
+function valueNoise(rnd, gw, gh) {
+  const g = []; for (let i = 0; i < (gw + 1) * (gh + 1); i++) g.push(rnd());
+  const s = t => t * t * (3 - 2 * t);
+  return (u, v) => {
+    const fx = u * gw, fy = v * gh, ix = Math.min(gw - 1, fx | 0), iy = Math.min(gh - 1, fy | 0);
+    const tx = s(fx - ix), ty = s(fy - iy), at = (a, b) => g[b * (gw + 1) + a];
+    const a = at(ix, iy) + (at(ix + 1, iy) - at(ix, iy)) * tx;
+    const b = at(ix, iy + 1) + (at(ix + 1, iy + 1) - at(ix, iy + 1)) * tx;
+    return a + (b - a) * ty;
+  };
+}
+function generateMap(seed) {
+  const C = CONFIG, rnd = mulberry32(seed), N = C.COLS * C.ROWS, T = [];
+  for (let i = 0; i < N; i++) { const t = newTile(); t.v = (rnd() * 4) | 0; T.push(t); }
+  // Coastline along the bottom edge
+  const ph = rnd() * 6.28;
+  for (let x = 0; x < C.COLS; x++) {
+    const d = clamp(Math.round(2.5 + 1.5 * Math.sin(x * 0.35 + ph) + rnd() * 0.8), 1, 5);
+    for (let y = C.ROWS - d; y < C.ROWS; y++) T[idx(x, y)].t = 'sea';
+  }
+  // Meandering river from the top edge to the sea
+  let x = 8 + ((rnd() * 16) | 0), dir = 0;
+  for (let y = 0; y < C.ROWS; y++) {
+    if (T[idx(x, y)].t === 'sea') break;
+    T[idx(x, y)].t = 'river';
+    if (y > C.ROWS * 0.45 && T[idx(x + 1, y)].t !== 'sea') T[idx(x + 1, y)].t = 'river'; // wider downstream
+    let step = rnd() < 0.5 ? 0 : (rnd() < 0.5 ? -1 : 1);
+    if (rnd() < 0.55) step = dir; dir = step;
+    const nx = clamp(x + step, 3, C.COLS - 5);
+    if (nx !== x && T[idx(nx, y)].t !== 'sea') T[idx(nx, y)].t = 'river';
+    x = nx;
+  }
+  // Distance to water (BFS)
+  const dist = new Array(N).fill(99), q = [];
+  T.forEach((t, i) => { if (isWaterT(t)) { dist[i] = 0; q.push(i); } });
+  for (let h = 0; h < q.length; h++) {
+    const i = q[h], cx = i % C.COLS, cy = (i / C.COLS) | 0;
+    for (const [dx, dy] of DIR4) { const nx = cx + dx, ny = cy + dy; if (!inB(nx, ny)) continue; const j = idx(nx, ny); if (dist[j] > dist[i] + 1) { dist[j] = dist[i] + 1; q.push(j); } }
+  }
+  // Elevation = distance from water + noise
+  const n1 = valueNoise(rnd, 4, 3), n2 = valueNoise(rnd, 9, 7);
+  T.forEach((t, i) => {
+    if (isWaterT(t)) { t.e = 0; return; }
+    const u = (i % C.COLS) / C.COLS, v = ((i / C.COLS) | 0) / C.ROWS;
+    const n = 0.7 * n1(u, v) + 0.3 * n2(u, v);
+    t.e = clamp(0.02 + 0.55 * Math.min(1, dist[i] / 9) + 0.45 * (n - 0.3), 0.04, 1);
+  });
+  // Classify: coastline sand, floodplain, hills
+  T.forEach((t, i) => {
+    if (isWaterT(t)) return;
+    const cx = i % C.COLS, cy = (i / C.COLS) | 0;
+    const nearSea = DIR4.some(([dx, dy]) => inB(cx + dx, cy + dy) && T[idx(cx + dx, cy + dy)].t === 'sea');
+    if (nearSea) { t.t = 'sand'; t.e = Math.min(t.e, 0.12); }
+    else if (t.e < 0.22 && dist[i] <= 4) t.t = 'flood';
+    else if (t.e > 0.72) t.t = 'hill';
+  });
+  return T;
+}
+
+/* =====================================================================
+   MODULE: SIMULATION  (state, placement, derived maps, yearly update)
+   ===================================================================== */
+function newState(seed) {
+  seed = seed == null ? (Math.random() * 1e9) | 0 : seed;
+  const st = {
+    version: 1, seed, year: 1, budget: CONFIG.startBudget, pop: 0, jobsCap: 0, filledJobs: 0, jobFactor: 0.5,
+    happiness: 60, happyTarget: 60, resilience: 50, recreation: 0, attract: 50,
+    protectedShare: 1, heatScore: 1, avgHeat: 0, floodShock: 0,
+    tiles: generateMap(seed),
+    stats: { gray: 0, nbs: 0, dev: 0, damage: 0, avoided: 0, floods: 0, heatwaves: 0, leveeFails: 0, heatLoss: 0, floodLoss: 0, abandoned: 0 },
+    recent: [], disasters: [], hist: [], lowHappy: 0, redYears: 0, over: false, result: null,
+  };
+  recomputeAll(st);
+  st.forecast = rollForecast(st);
+  return st;
+}
+function addSpend(st, cat, amt) {
+  if (cat === 'gray') st.stats.gray += amt; else if (cat === 'nature') st.stats.nbs += amt; else st.stats.dev += amt;
+}
+function roadAccessMap(st) {
+  const C = CONFIG, m = new Uint8Array(st.tiles.length);
+  st.tiles.forEach((t, i) => { if (t.b === 'road') forRadius(i % C.COLS, (i / C.COLS) | 0, C.growth.roadReach, j => (m[j] = 1)); });
+  return m;
+}
+
+/** Can `tool` be used at (x,y)? Returns {ok, cost, reason}. */
+function canPlace(st, tool, x, y) {
+  const C = CONFIG, t = st.tiles[idx(x, y)], it = C.items[tool];
+  if (st.over) return { ok: false, reason: 'GAME OVER - START A NEW GAME' };
+  if (tool === 'inspect') return { ok: true, cost: 0 };
+  if (tool === 'demolish') {
+    if (!t.b && !t.roof) return { ok: false, reason: 'NOTHING TO DEMOLISH' };
+    if (st.budget < it.cost) return { ok: false, reason: 'NOT ENOUGH MONEY', cost: it.cost };
+    return { ok: true, cost: it.cost };
+  }
+  if (isWaterT(t)) return { ok: false, reason: 'CANNOT BUILD ON WATER' };
+  let cost = it.cost;
+  if (tool === 'roof') {
+    if (!(t.b === 'res' || t.b === 'com') || t.ab) return { ok: false, reason: 'GREEN ROOFS GO ON A RESIDENTIAL OR COMMERCIAL ZONE' };
+    if (t.roof) return { ok: false, reason: 'ALREADY HAS A GREEN ROOF' };
+  } else {
+    if (t.b) return { ok: false, reason: 'TILE OCCUPIED - DEMOLISH FIRST' };
+    if (it.only === 'flood' && t.t !== 'flood') return { ok: false, reason: 'WETLANDS CAN ONLY BE RESTORED ON FLOODPLAIN TILES' };
+    if (t.t === 'hill' && it.cat === 'dev') cost = Math.round(cost * C.hillCostMult);
+  }
+  if (st.budget < cost) return { ok: false, reason: 'NOT ENOUGH MONEY', cost };
+  return { ok: true, cost };
+}
+function place(st, tool, x, y) {
+  const r = canPlace(st, tool, x, y);
+  if (!r.ok || tool === 'inspect') return r;
+  const t = st.tiles[idx(x, y)], it = CONFIG.items[tool];
+  if (tool === 'demolish') {
+    if (t.b) { t.b = null; t.pop = 0; t.jobs = 0; t.ab = false; t.fh = []; t.age = 0; }
+    t.roof = false; t.scar = false; addSpend(st, 'dev', r.cost);
+  } else if (tool === 'roof') { t.roof = true; t.roofAge = 0; addSpend(st, 'nature', r.cost); }
+  else { t.b = tool; t.age = 0; t.pop = 0; t.jobs = 0; t.ab = false; t.fh = []; t.scar = false; addSpend(st, it.cat, r.cost); }
+  st.budget -= r.cost;
+  recomputeAll(st);
+  return r;
+}
+
+/** Heat-island score per tile (0..1): pavement & buildings warm, trees, parks, wetlands & water cool. */
+function computeHeat(st) {
+  const C = CONFIG, T = st.tiles, H = C.heat, W = [1, 0.5, 0.2];
+  const src = new Float32Array(T.length), cool = new Uint8Array(T.length);
+  T.forEach((t, i) => {
+    let s = isWaterT(t) ? H.waterCool : 0;
+    if (t.b) { const it = C.items[t.b]; s += (it.heatRed || 0) * eff(it, t.age); }
+    if (t.roof) s += C.items.roof.heatRed * eff(C.items.roof, t.roofAge);
+    src[i] = s;
+    if (t.b === 'cool') forRadius(i % C.COLS, (i / C.COLS) | 0, C.items.cool.radius, j => (cool[j] = 1));
+  });
+  T.forEach((t, i) => {
+    let h = H.baseTile + (t.t === 'hill' ? -0.03 : 0);
+    forRadius(i % C.COLS, (i / C.COLS) | 0, 2, (j, d) => { h -= src[j] * W[d]; });
+    t.heat = clamp(h, 0, 1); t.cooled = cool[i];
+  });
+}
+
+/** Flood depth for a water `level`. mode 'event' rolls failures; 'preview' is deterministic. */
+function floodDepths(st, level, mode, extreme) {
+  const C = CONFIG, F = C.flood, I = C.items, T = st.tiles, N = T.length;
+  const raw = new Float32Array(N), seen = new Uint8Array(N), q = [];
+  T.forEach((t, i) => { if (isWaterT(t)) { seen[i] = 1; q.push(i); } });
+  while (q.length) { // water spreads from river & sea into connected low tiles
+    const i = q.pop(), x = i % C.COLS, y = (i / C.COLS) | 0;
+    for (const [dx, dy] of DIR4) {
+      const nx = x + dx, ny = y + dy; if (!inB(nx, ny)) continue;
+      const j = idx(nx, ny); if (seen[j]) continue;
+      if (T[j].e < level) { seen[j] = 1; raw[j] = level - T[j].e; q.push(j); }
+    }
+  }
+  const nbs = new Float32Array(N), gray = new Float32Array(N), clogged = [];
+  T.forEach((t, i) => {
+    const x = i % C.COLS, y = (i / C.COLS) | 0;
+    if (t.b === 'drain') {
+      if (mode === 'event' && extreme && Math.random() < I.drain.fail) { clogged.push(i); return; }
+      forRadius(x, y, I.drain.radius, j => (gray[j] += I.drain.flood));
+    } else if (t.b === 'wetland' || t.b === 'park' || t.b === 'swale') {
+      const it = I[t.b], e = it.flood * eff(it, t.age);
+      forRadius(x, y, it.radius, j => (nbs[j] += e));
+    }
+    if (t.roof) nbs[i] += I.roof.flood * eff(I.roof, t.roofAge);
+  });
+  const net = new Float32Array(N);
+  for (let i = 0; i < N; i++) net[i] = Math.max(0, raw[i] - Math.min(F.nbsCap, nbs[i]) - Math.min(F.grayCap, gray[i]));
+  // Levees: protect covered tiles up to the threshold; overtopping or breach = failure + surge
+  const failed = [], protect = new Uint8Array(N), hit = new Uint8Array(N);
+  T.forEach((t, i) => {
+    if (t.b !== 'levee') return;
+    const x = i % C.COLS, y = (i / C.COLS) | 0; let wet = false, over = false;
+    forRadius(x, y, I.levee.radius, j => { if (net[j] > 0.001) wet = true; if (net[j] > I.levee.flood) over = true; });
+    const breach = mode === 'event' && extreme && wet && Math.random() < I.levee.fail;
+    const fail = over || breach;
+    if (fail) failed.push(i);
+    forRadius(x, y, I.levee.radius, j => { if (fail) hit[j] = 1; else protect[j] = 1; });
+  });
+  for (let i = 0; i < N; i++) {
+    if (net[i] <= 0) continue;
+    if (protect[i] && net[i] <= I.levee.flood) net[i] = 0;
+    else if (hit[i]) net[i] += F.leveeSurge;
+  }
+  return { raw, net, failed, clogged };
+}
+function levelFor(sev) { const F = CONFIG.flood; return F.levelBase + F.levelPerSev * sev; }
+function designLevel(st) { const F = CONFIG.flood; return levelFor(F.designSev * (1 + F.sevTrend * st.year)); }
+function computeRisk(st) {
+  const r = floodDepths(st, designLevel(st), 'preview', false);
+  st.tiles.forEach((t, i) => { t.risk = r.net[i]; t.rawRisk = r.raw[i]; });
+}
+/** Land value (0..1): parks, wetlands, water views and jobs raise it; risk, heat and walls lower it. */
+function computeLandValue(st) {
+  const C = CONFIG, T = st.tiles, W = [1, 1, 0.6, 0.3];
+  const boost = new Float32Array(T.length);
+  T.forEach((t, i) => {
+    let b = 0;
+    if (t.b) { const it = C.items[t.b]; b += (it.lv || 0) * eff(it, t.age); }
+    if (t.roof) b += C.items.roof.lv;
+    if (b) forRadius(i % C.COLS, (i / C.COLS) | 0, 3, (j, d) => (boost[j] += b * W[d]));
+  });
+  T.forEach((t, i) => {
+    if (isWaterT(t)) { t.lv = 0; return; }
+    let water = false; forRadius(i % C.COLS, (i / C.COLS) | 0, 2, j => { if (isWaterT(T[j])) water = true; });
+    let lv = 0.35 + (t.t === 'hill' ? 0.08 : 0) + (water ? 0.05 : 0) + boost[i];
+    lv -= Math.min(0.25, t.risk * 0.6);
+    lv -= Math.max(0, t.heat - 0.45) * 0.4;
+    t.lv = clamp(lv, 0, 1);
+  });
+}
+/** City-wide metrics: population, jobs, recreation, attractiveness, happiness target, resilience. */
+function computeMetrics(st) {
+  const C = CONFIG, T = st.tiles, F = C.flood, R = C.resilience, reach = roadAccessMap(st);
+  let pop = 0, rec = 0, attrSum = 0, resTiles = 0, roofs = 0, comCap = 0, heatW = 0, lvW = 0, riskPop = 0, harmW = 0;
+  T.forEach((t, i) => {
+    if (t.b) { const it = C.items[t.b], e = eff(it, t.age); rec += (it.rec || 0) * e; attrSum += (it.attr || 0) * e; }
+    if (t.roof) { const it = C.items.roof, e = eff(it, t.roofAge); rec += it.rec * e; attrSum += it.attr * e; roofs++; }
+    if (t.b === 'res') {
+      resTiles++; pop += t.pop; heatW += t.heat * t.pop; lvW += t.lv * t.pop;
+      if (t.risk > F.damageDepth) riskPop += t.pop;
+      harmW += t.pop * clamp((t.heat - R.heatLow) / (R.heatHigh - R.heatLow), 0, 1) * (t.cooled ? 1 - C.items.cool.harmCut : 1);
+    }
+    if (t.b === 'com' && !t.ab && reach[i]) comCap += C.items.com.jobs * (0.5 + t.lv);
+  });
+  st.pop = pop; st.recreation = Math.round(rec); st.jobsCap = Math.round(comCap);
+  st.filledJobs = Math.min(comCap, pop * C.econ.workerShare);
+  T.forEach((t, i) => { if (t.b === 'com') t.jobs = (!t.ab && reach[i] && comCap) ? Math.round(C.items.com.jobs * (0.5 + t.lv) * st.filledJobs / comCap) : 0; });
+  const jobFactor = clamp(comCap / (Math.max(pop, 200) * C.econ.workerShare), 0.3, 1.2);
+  st.jobFactor = jobFactor;
+  const avgHeat = pop ? heatW / pop : 0, avgLv = pop ? lvW / pop : 0.45, riskShare = pop ? riskPop / pop : 0;
+  const recPer1k = rec / Math.max(0.5, pop / 1000);
+  const recentDis = st.disasters.filter(y => y > st.year - 3).length;
+  const itemTerm = clamp(attrSum / Math.max(4, resTiles) * 20, -20, 25);
+  st.attract = Math.round(clamp(45 + itemTerm + clamp((jobFactor - 0.8) * 25, -10, 8) - riskShare * 25 - recentDis * 6 + (avgLv - 0.45) * 30, 0, 100));
+  st.happyTarget = clamp(50 + clamp(recPer1k * 0.5, 0, 18) + (jobFactor >= 0.8 ? 4 : -(0.8 - jobFactor) * 20) - avgHeat * 20 + Math.min(5, roofs * 0.5) - st.floodShock, 0, 100);
+  // Resilience = protected population + low heat exposure + damage avoided recently
+  const prot = pop ? 1 - riskShare : 1, heatScore = pop ? 1 - harmW / pop : 1;
+  let av = 0, dm = 0; st.recent.filter(r => r.year > st.year - 5).forEach(r => { av += r.avoided; dm += r.dmg; });
+  const avoidRatio = av + dm > 1 ? av / (av + dm) : prot;
+  st.resilience = Math.round(100 * (R.wProtected * prot + R.wHeat * heatScore + R.wAvoided * avoidRatio));
+  st.protectedShare = prot; st.heatScore = heatScore; st.avgHeat = avgHeat;
+}
+function recomputeAll(st) { computeHeat(st); computeRisk(st); computeLandValue(st); computeMetrics(st); }
+
+function updatePopulation(st) {
+  // Migration demand: how many newcomers want to move in this year (attractiveness, happiness and jobs drive it).
+  const C = CONFIG, G = C.growth, reach = roadAccessMap(st), T = st.tiles;
+  const f = clamp(st.jobFactor * (st.attract / 50) * (st.happiness / 60), 0, G.maxFactor);
+  st.growthFactor = f;
+  let demand = (G.migrationBase + G.migrationRate * st.pop) * f, room = 0;
+  const caps = T.map((t, i) => (t.b === 'res' && reach[i] && !t.ab ? C.items.res.cap * (0.5 + t.lv) : 0));
+  T.forEach((t, i) => { if (t.b !== 'res') return; if (t.pop > caps[i]) t.pop = Math.round(t.pop - (t.pop - caps[i]) * G.shrink); else room += caps[i] - t.pop; });
+  const share = room > 0 ? Math.min(1, demand / room) : 0;
+  T.forEach((t, i) => { if (t.b === 'res' && t.pop < caps[i]) t.pop = Math.round(t.pop + (caps[i] - t.pop) * share); });
+}
+
+/** One full year: taxes, upkeep, population, hazards, aging, win/lose. Returns a report. */
+function endYear(st) {
+  if (st.over) return null;
+  const C = CONFIG, rep = { year: st.year };
+  recomputeAll(st);
+  rep.taxes = Math.round(st.pop * C.econ.taxPerResident + st.filledJobs * C.econ.taxPerJob);
+  let up = 0;
+  st.tiles.forEach(t => {
+    if (t.b) { const it = C.items[t.b], u = it.upkeep || 0; up += u; addSpend(st, it.cat, u); }
+    if (t.roof) { up += C.items.roof.upkeep; addSpend(st, 'nature', C.items.roof.upkeep); }
+  });
+  rep.upkeep = up; st.budget += rep.taxes - up;
+  updatePopulation(st); recomputeAll(st);
+  st.happiness = clamp(st.happiness * 0.4 + st.happyTarget * 0.6, 0, 100);
+  const fc = st.forecast;
+  if (fc.flood) rep.flood = applyFlood(st, fc.sev, fc.extreme);
+  if (fc.heat) rep.heat = applyHeat(st, fc.inten);
+  st.tiles.forEach(t => { if (t.b) t.age++; if (t.roof) t.roofAge++; });
+  st.floodShock *= 0.5;
+  st.hist.push({ year: st.year, pop: st.pop, budget: Math.round(st.budget), happiness: Math.round(st.happiness), resilience: st.resilience });
+  st.year++;
+  recomputeAll(st);
+  st.lowHappy = st.happiness < C.loseHappiness ? st.lowHappy + 1 : 0;
+  st.redYears = st.budget < 0 ? st.redYears + 1 : 0;
+  if (st.pop >= C.winPop && st.resilience >= C.winResilience && st.budget >= 0) finish(st, 'win');
+  else if (st.redYears >= C.bankruptYears) finish(st, 'bankrupt');
+  else if (st.lowHappy >= C.loseHappyYears) finish(st, 'unhappy');
+  else if (st.year > C.maxYears) finish(st, 'time');
+  rep.warnBankrupt = st.budget < 0 && !st.over;
+  rep.warnHappy = st.lowHappy > 0 && !st.over;
+  st.forecast = rollForecast(st);
+  return rep;
+}
+function finish(st, result) { st.over = true; st.result = result; }
+
+/* =====================================================================
+   MODULE: HAZARDS  (forecast, floods, heat waves)
+   ===================================================================== */
+/** Pre-roll next year's hazards so the forecast bar can show chance and likely severity. */
+function rollForecast(st) {
+  const y = st.year, F = CONFIG.flood, H = CONFIG.heat;
+  const fc = Math.min(F.maxChance, F.baseChance + F.chanceTrend * y);
+  const hc = Math.min(H.maxChance, H.baseChance + H.chanceTrend * y);
+  const extreme = Math.random() < F.extremeChance + F.extremeTrend * y;
+  let sev = (F.sevMin + Math.random() * F.sevRange) * (1 + F.sevTrend * y); if (extreme) sev *= F.extremeMult;
+  const inten = (H.intMin + Math.random() * H.intRange) * (1 + H.intTrend * y);
+  return { fc, hc, flood: Math.random() < fc, sev, extreme, heat: Math.random() < hc, inten };
+}
+function floodLabel(fc) { if (fc.extreme) return 'EXTREME'; const l = levelFor(fc.sev); return l < 0.2 ? 'LOW' : l < 0.3 ? 'MODERATE' : l < 0.4 ? 'HIGH' : 'SEVERE'; }
+function heatLabel(fc) { const i = fc.inten; return i < 0.8 ? 'LOW' : i < 1.0 ? 'MODERATE' : i < 1.2 ? 'HIGH' : 'SEVERE'; }
+function dmgCost(t, d) { if (!t.b || d <= CONFIG.flood.damageDepth) return 0; return (CONFIG.items[t.b].dmg || 0) * d; }
+
+function applyFlood(st, sev, extreme) {
+  const C = CONFIG, F = C.flood, T = st.tiles, level = levelFor(sev);
+  const r = floodDepths(st, level, 'event', extreme);
+  let dmg = 0, raw = 0, popLost = 0, hit = 0, aband = 0; const before = st.pop;
+  T.forEach((t, i) => {
+    t.fx = isWaterT(t) ? 0 : r.net[i];
+    if (!t.b) return;
+    raw += dmgCost(t, r.raw[i]);
+    const d = r.net[i]; if (d <= F.damageDepth) return;
+    const c = dmgCost(t, d); dmg += c; if (c > 0) { hit++; t.dmgYear = st.year; }
+    if (t.b === 'res' || t.b === 'com') {
+      t.fh.push(st.year); t.fh = t.fh.filter(y => y > st.year - F.abandonWindow);
+      if (t.b === 'res') { const l = Math.round(t.pop * Math.min(0.8, d * F.popLossPerDepth)); t.pop -= l; popLost += l; }
+      if (!t.ab && t.fh.length >= F.abandonCount) { t.ab = true; popLost += t.pop; t.pop = 0; t.roof = false; aband++; }
+    }
+  });
+  r.failed.forEach(i => { T[i].b = null; T[i].scar = true; T[i].dmgYear = st.year; });
+  dmg = Math.round(dmg); const avoided = Math.round(Math.max(0, raw - dmg));
+  st.budget -= dmg;
+  Object.assign(st.stats, { damage: st.stats.damage + dmg, avoided: st.stats.avoided + avoided, floods: st.stats.floods + 1,
+    leveeFails: st.stats.leveeFails + r.failed.length, floodLoss: st.stats.floodLoss + popLost, abandoned: st.stats.abandoned + aband });
+  st.recent.push({ year: st.year, dmg, avoided });
+  if (hit > 0) {
+    st.disasters.push(st.year);
+    const hh = Math.min(25, 4 + (popLost / Math.max(1, before)) * 80);
+    st.happiness = clamp(st.happiness - hh, 0, 100); st.floodShock += hh * 0.5;
+  }
+  recomputeAll(st);
+  return { sev, extreme, level, dmg, avoided, popLost, hit, aband, failed: r.failed.length, clogged: r.clogged.length };
+}
+function applyHeat(st, inten) {
+  const C = CONFIG, H = C.heat; let lost = 0, hot = 0, cooledSaved = 0; const before = st.pop;
+  st.tiles.forEach(t => {
+    t.hx = t.heat * inten;
+    if (t.b !== 'res' || !t.pop || t.hx <= H.harmThreshold) return;
+    let harm = (t.hx - H.harmThreshold) * H.harmK;
+    if (t.cooled) { cooledSaved += Math.round(t.pop * Math.min(0.5, harm) * C.items.cool.harmCut); harm *= 1 - C.items.cool.harmCut; }
+    harm = Math.min(0.5, harm);
+    const l = Math.round(t.pop * harm); t.pop -= l; lost += l; hot++;
+  });
+  const hh = hot ? Math.min(22, 3 + (lost / Math.max(1, before)) * 150) : 0;
+  st.happiness = clamp(st.happiness - hh, 0, 100);
+  st.stats.heatwaves++; st.stats.heatLoss += lost;
+  recomputeAll(st);
+  return { inten, lost, hot, hh, cooledSaved };
+}
+
+/** Three tailored lessons for the end-of-game report. */
+function lessons(st) {
+  const s = st.stats, tot = s.gray + s.nbs || 1, gs = s.gray / tot, ns = s.nbs / tot, L = [];
+  if (s.leveeFails > 0) L.push(`${s.leveeFails} levee failure(s): walls protect well until a flood exceeds their design, then the damage is sudden and severe.`);
+  if (gs > 0.65) L.push('Most protection money went to gray infrastructure. It worked at once, but upkeep and the lack of green space held back happiness and growth.');
+  if (ns > 0.65 && s.damage > s.avoided * 0.5) L.push('Nature-based solutions cut everyday flooding and heat, but the biggest floods exceeded what soils and wetlands can absorb.');
+  if (s.abandoned > 0) L.push(`${s.abandoned} buildings were abandoned after repeat flooding. Keeping homes out of the floodplain is often the cheapest protection.`);
+  if (st.heatScore < 0.6 || s.heatLoss > Math.max(200, st.pop * 0.1)) L.push("Heat waves hit paved, treeless blocks hardest. Parks, green roofs and wetlands cool neighborhoods; cooling centers reduce harm but don't cool the city.");
+  if (s.avoided > s.damage && s.avoided > 0) L.push(`Your defenses avoided $${fmt(s.avoided)} in damage versus $${fmt(s.damage)} lost. Prevention pays off over time.`);
+  if (gs > 0.25 && ns > 0.25) L.push('You mixed gray and green. Walls and drains handled extremes while nature added cooling, recreation and land value.');
+  if (st.recreation < 20) L.push('Residents had few places to play. Recreation and attractiveness drive migration as much as safety does.');
+  L.push('Wetlands and trees take years to mature. Plant early so they are ready when the risks rise.');
+  L.push("Climate risk grows every year. Plan for the next decade's floods, not last year's.");
+  return L.slice(0, 3);
+}
+
+/* =====================================================================
+   MODULE: SPRITES  (every sprite drawn in code with fillRect)
+   ===================================================================== */
+const PAL = { // 24-color retro palette
+  ink: '#0f0f1b', navy: '#262b44', slate: '#3a4466', steel: '#5a6988', gray: '#8b9bb4', pale: '#c0cbdc', white: '#ffffff',
+  dgreen: '#1a4d2e', green: '#2f7d32', mgreen: '#3e8948', lgreen: '#63c74d', pgreen: '#a8d86b',
+  dwater: '#124e89', water: '#0099db', foam: '#2ce8f5',
+  brown: '#733e39', dirt: '#8f563b', tan: '#b86f50', sand: '#e4a672',
+  orange: '#feae34', hot: '#f77622', red: '#e43b44', yellow: '#fee761', purple: '#68386c',
+};
+const FONT_SRC = { // 3x5 blocky pixel font
+  A:'010101111101101',B:'110101110101110',C:'011100100100011',D:'110101101101110',E:'111100110100111',F:'111100110100100',G:'011100101101011',
+  H:'101101111101101',I:'111010010010111',J:'001001001101010',K:'101101110101101',L:'100100100100111',M:'101111111101101',N:'110101101101101',
+  O:'010101101101010',P:'110101110100100',Q:'010101101110011',R:'110101110101101',S:'011100010001110',T:'111010010010010',U:'101101101101111',
+  V:'101101101101010',W:'101101111111101',X:'101101010101101',Y:'101101010010010',Z:'111001010100111',
+  0:'111101101101111',1:'010110010010111',2:'110001010100111',3:'110001010001110',4:'101101111001001',5:'111100110001110',
+  6:'011100111101111',7:'111001010010010',8:'111101111101111',9:'111101111001110',
+  ' ':'000000000000000','.':'000000000000010',',':'000000000010100',':':'000010000010000','!':'010010010000010','?':'110001010000010',
+  '-':'000000111000000','+':'000010111010000','%':'101001010100101','$':'011110010011110','/':'001001010100100','(':'010100100100010',
+  ')':'010001001001010',"'":'010010000000000','=':'000111000111000','>':'100010001010100','<':'001010100010001','#':'101111101111101',
+  '_':'000000000000111','&':'010101010101011','*':'000101010101000','"':'101101000000000',';':'000010000010100','[':'110100100100110',
+  ']':'011001001001011','|':'010010010010010',
+};
+const SPR = {};
+function mk(fn, w = 16, h = 16) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const g = c.getContext('2d');
+  fn((col, x, y, ww = 1, hh = 1) => { g.fillStyle = col; g.fillRect(x, y, ww, hh); });
+  return c;
+}
+function buildSprites() {
+  const P = PAL;
+  const speck = (p, base, cols, seed, n) => { p(base, 0, 0, 16, 16); const r = mulberry32(seed); for (let k = 0; k < n; k++) p(cols[k % cols.length], (r() * 16) | 0, (r() * 16) | 0); };
+  const grass = (p, s = 5) => speck(p, P.mgreen, [P.lgreen, P.green], s, 8);
+  const glyph = (p, ch, x, y, col, s = 1) => { const g = FONT_SRC[ch]; for (let b = 0; b < 15; b++) if (g[b] === '1') p(col, x + (b % 3) * s, y + ((b / 3) | 0) * s, s, s); };
+  const house = (p, x, y, roof, wall) => {
+    p(P.dgreen, x + 1, y + 7, 7, 1);
+    p(roof, x + 2, y, 4, 1); p(roof, x + 1, y + 1, 6, 1); p(roof, x, y + 2, 8, 1);
+    p(wall, x + 1, y + 3, 6, 4); p(P.navy, x + 2, y + 4, 1, 1); p(P.navy, x + 5, y + 4, 1, 1); p(P.brown, x + 3, y + 5, 2, 2);
+  };
+  const tree = (p, x, y, o, small) => {
+    if (small) { p(P.brown, x + 2, y + 3, 1, 2); p(P.green, x + 1 + o, y + 1, 3, 2); p(P.lgreen, x + 2 + o, y, 1, 1); return; }
+    p(P.brown, x + 2, y + 4, 1, 3); p(P.dgreen, x + 1 + o, y, 3, 1); p(P.dgreen, x + o, y + 1, 5, 3); p(P.dgreen, x + 1, y + 4, 3, 1);
+    p(P.green, x + 1 + o, y + 1, 2, 2); p(P.lgreen, x + 1 + o, y + 1, 1, 1);
+  };
+  // Terrain
+  SPR.grass = [0, 1, 2, 3].map(v => mk(p => speck(p, P.mgreen, [P.lgreen, P.green], v + 11, 10)));
+  SPR.fplain = [0, 1].map(v => mk(p => { speck(p, P.mgreen, [P.green], v + 31, 6); const r = mulberry32(v + 77); for (let k = 0; k < 5; k++) p(P.dgreen, (r() * 13) | 0, (r() * 15) | 0, 3, 1); }));
+  SPR.hill = [0, 1].map(v => mk(p => { speck(p, P.lgreen, [P.pgreen, P.mgreen], v + 51, 10); p(P.mgreen, 0, 13, 16, 3); p(P.green, 0, 15, 16, 1); p(P.pgreen, 3, 3, 6, 1); p(P.pgreen, 2, 4, 2, 1); }));
+  SPR.sand = [0, 1].map(v => mk(p => speck(p, P.sand, [P.tan, P.white], v + 61, 8)));
+  SPR.river = [0, 1, 2].map(f => mk(p => { p(P.water, 0, 0, 16, 16); [[2, 0], [7, 6], [12, 11]].forEach(([y, o]) => { const x = (o + f * 3) % 16; p(P.foam, x, y, 3, 1); p(P.dwater, (x + 8) % 16, y + 2, 3, 1); }); }));
+  SPR.sea = [0, 1, 2].map(f => mk(p => { p(P.dwater, 0, 0, 16, 16); [[3, 2], [9, 9], [14, 5]].forEach(([y, o]) => { const x = (o + f * 2) % 16; p(P.water, x, y, 4, 1); p(P.foam, x + 1, y - 1, 2, 1); }); }));
+  SPR.scar = mk(p => { p(P.dirt, 3, 4, 4, 3); p(P.brown, 9, 8, 3, 3); p(P.tan, 6, 10, 2, 1); p(P.gray, 11, 3, 2, 1); });
+  // Roads (16 connection masks: N=1 E=2 S=4 W=8)
+  SPR.road = [];
+  for (let m = 0; m < 16; m++) SPR.road.push(mk(p => {
+    grass(p, 3); const R = P.slate;
+    p(R, 3, 3, 10, 10); if (m & 1) p(R, 3, 0, 10, 3); if (m & 2) p(R, 13, 3, 3, 10); if (m & 4) p(R, 3, 13, 10, 3); if (m & 8) p(R, 0, 3, 3, 10);
+    const hz = m & 10, vt = m & 5;
+    if (hz && !vt) for (let x = m & 8 ? 0 : 4; x < (m & 2 ? 16 : 12); x += 4) p(P.yellow, x, 7, 2, 1);
+    if (vt && !hz) for (let y = m & 1 ? 0 : 4; y < (m & 4 ? 16 : 12); y += 4) p(P.yellow, 7, y, 1, 2);
+    if (hz && vt) { p(P.steel, 5, 5, 6, 6); }
+  }));
+  // Residential (levels 0-2), normal and green-roof
+  const resSet = roof => [
+    mk(p => { grass(p); house(p, 4, 5, roof, P.pale); tree(p, 0, 0, 0, true); }),
+    mk(p => { grass(p); house(p, 0, 1, roof, P.pale); house(p, 8, 8, roof, P.sand); }),
+    mk(p => { grass(p); p(P.slate, 2, 2, 12, 13); p(P.tan, 3, 4, 10, 11); p(roof, 2, 1, 12, 3);
+      for (const wx of [4, 7, 10]) for (const wy of [6, 9]) { p(P.navy, wx, wy, 2, 2); p(P.foam, wx, wy, 1, 1); } p(P.brown, 7, 12, 2, 3); }),
+  ];
+  SPR.res = resSet(P.red); SPR.resG = resSet(P.lgreen);
+  SPR.resEmpty = mk(p => { grass(p); for (let k = 0; k < 16; k += 2) { p(P.pgreen, k, 0); p(P.pgreen, k, 15); p(P.pgreen, 0, k); p(P.pgreen, 15, k); } glyph(p, 'R', 5, 3, P.pgreen, 2); });
+  SPR.resAb = mk(p => { speck(p, P.mgreen, [P.brown, P.dirt], 9, 10); house(p, 4, 5, P.brown, P.gray); p(P.ink, 6, 5, 2, 1); p(P.tan, 6, 9, 1, 1); p(P.tan, 9, 9, 1, 1); p(P.ink, 9, 11, 1, 1); });
+  const comSet = roof => [
+    mk(p => { grass(p); p(P.slate, 2, 5, 12, 10); p(P.steel, 3, 6, 10, 8); p(roof, 2, 2, 12, 2); for (let k = 0; k < 12; k++) p(k % 2 ? P.white : P.red, 2 + k, 4, 1, 2);
+      p(P.foam, 4, 8, 3, 3); p(P.foam, 9, 8, 3, 3); p(P.navy, 7, 10, 2, 4); }),
+    mk(p => { grass(p); p(P.slate, 3, 1, 10, 15); p(roof, 3, 1, 10, 2); let k = 0;
+      for (let wy = 4; wy < 13; wy += 3) for (const wx of [4, 7, 10]) p(k++ % 3 ? P.foam : P.yellow, wx, wy, 2, 2); p(P.ink, 7, 13, 2, 3); }),
+  ];
+  SPR.com = comSet(P.purple); SPR.comG = comSet(P.lgreen);
+  SPR.comEmpty = mk(p => { grass(p); for (let k = 0; k < 16; k += 2) { p(P.foam, k, 0); p(P.foam, k, 15); p(P.foam, 0, k); p(P.foam, 15, k); } glyph(p, 'C', 5, 3, P.foam, 2); });
+  SPR.comAb = mk(p => { speck(p, P.mgreen, [P.brown, P.dirt], 19, 10); p(P.slate, 2, 5, 12, 10); p(P.gray, 3, 6, 10, 8); p(P.ink, 4, 8, 3, 3); p(P.tan, 9, 8, 3, 1); p(P.ink, 9, 9, 3, 2); p(P.ink, 7, 10, 2, 4); });
+  // Gray infrastructure
+  SPR.levee = mk(p => { p(P.gray, 0, 0, 16, 16); p(P.pale, 0, 0, 16, 2);
+    for (let r = 0; r < 4; r++) { const y = 2 + r * 3; p(P.steel, 0, y + 2, 16, 1); for (let x = r % 2 ? 0 : 4; x < 16; x += 8) p(P.steel, x, y, 1, 2); }
+    p(P.ink, 0, 15, 16, 1); p(P.yellow, 0, 2, 2, 1); p(P.yellow, 14, 2, 2, 1); });
+  SPR.drain = mk(p => { speck(p, P.slate, [P.steel], 41, 8); p(P.ink, 3, 3, 10, 10); for (let x = 4; x < 12; x += 2) p(P.steel, x, 4, 1, 8); p(P.water, 4, 11, 8, 1); p(P.gray, 3, 3, 10, 1); });
+  SPR.cool = mk(p => { grass(p); p(P.slate, 2, 4, 12, 11); p(P.white, 3, 5, 10, 9); p(P.foam, 2, 2, 12, 3); p(P.water, 7, 6, 2, 6); p(P.water, 5, 8, 6, 2); p(P.navy, 7, 12, 2, 2); });
+  // Nature-based solutions
+  SPR.wetland = [0, 1, -1].map((s, f) => mk(p => {
+    p(P.green, 0, 0, 16, 16); p(P.water, 3, 6, 6, 4); p(P.water, 2, 7, 8, 2); p(P.water, 9, 2, 5, 3); p(P.water, 8, 10, 6, 3);
+    p(P.foam, 4 + f, 7, 2, 1); p(P.foam, 10 + (f % 2), 3, 1, 1);
+    [[2, 3], [5, 1], [12, 7], [14, 12], [3, 12], [7, 13], [1, 9]].forEach(([x, y]) => { p(P.lgreen, x, y + 1, 1, 3); p(P.brown, x + s, y - 1, 1, 2); });
+  }));
+  SPR.wetYoung = mk(p => { speck(p, P.mgreen, [P.dirt, P.brown], 71, 10); p(P.water, 4, 6, 5, 3); p(P.water, 9, 10, 4, 2); [[2, 4], [12, 5], [6, 12]].forEach(([x, y]) => p(P.lgreen, x, y, 1, 2)); });
+  const parkBase = p => { speck(p, P.lgreen, [P.pgreen, P.mgreen], 81, 12); for (let k = 0; k < 16; k++) p(P.sand, k, 10 + ((k / 6) | 0), 1, 2); p(P.red, 13, 3); p(P.yellow, 2, 13); p(P.white, 10, 14); };
+  SPR.park = [0, 1, -1].map(s => mk(p => { parkBase(p); tree(p, 1, 1, s); tree(p, 9, 0, s); tree(p, 6, 6, s === 0 ? 0 : -s); }));
+  SPR.parkYoung = mk(p => { parkBase(p); tree(p, 2, 3, 0, true); tree(p, 10, 2, 0, true); tree(p, 6, 7, 0, true); });
+  SPR.swale = mk(p => { grass(p, 7); for (let x = 0; x < 16; x++) { const y = 7 + Math.round(Math.sin(x * 0.6) * 1.5); p(P.dwater, x, y, 1, 2); p(P.water, x, y, 1, 1);
+      if (x % 3 === 0) p(P.dgreen, x, y - 1); if (x % 5 === 1) p(P.yellow, x, y + 3); if (x % 4 === 2) p(P.lgreen, x, y - 2, 1, 2); } });
+  // Effects & markers
+  SPR.floodFx = [0, 1, 2].map(f => mk(p => { p(P.water, 0, 0, 16, 16); p(P.foam, (f * 4 + 2) % 16, 3, 4, 1); p(P.foam, (f * 4 + 9) % 16, 9, 3, 1); p(P.foam, (f * 4 + 5) % 16, 13, 3, 1); }));
+  SPR.heatFx = [0, 1, 2].map(f => mk(p => { [2, 7, 12].forEach((c, k) => { for (let s = 0; s < 3; s++) { const y = (14 - f * 4 - s * 5 + k * 3 + 32) % 16; p(s % 2 ? P.yellow : P.hot, c + ((s + f) % 2), y, 1, 2); } }); }));
+  SPR.dmg = mk(p => { p(P.ink, 0, 0, 5, 7); p(P.red, 0, 0, 4, 6); p(P.white, 1, 1, 2, 3); p(P.white, 1, 5 - 0, 2, 0); p(P.white, 1, 4, 2, 1); }, 5, 7);
+  // Icons
+  SPR.icInspect = mk(p => { p(P.pale, 4, 2, 4, 1); p(P.pale, 4, 8, 4, 1); p(P.pale, 3, 3, 1, 5); p(P.pale, 8, 3, 1, 5); p(P.foam, 4, 3, 4, 5); p(P.white, 4, 3, 1, 2); for (let k = 0; k < 5; k++) p(P.tan, 8 + k, 8 + k, 2, 2); });
+  SPR.icDemolish = mk(p => { p(P.orange, 3, 6, 8, 4); p(P.orange, 5, 3, 4, 3); p(P.foam, 6, 4, 2, 1); p(P.ink, 2, 10, 10, 3); p(P.steel, 3, 11, 8, 1); p(P.gray, 12, 4, 2, 8); p(P.pale, 11, 7, 1, 1); });
+  SPR.icSun = mk(p => { p(P.yellow, 5, 4, 6, 8); p(P.yellow, 4, 5, 8, 6); p(P.white, 6, 6, 2, 2);
+    [[7, 0, 2, 3], [7, 13, 2, 3], [0, 7, 3, 2], [13, 7, 3, 2], [2, 2, 2, 2], [12, 2, 2, 2], [2, 12, 2, 2], [12, 12, 2, 2]].forEach(a => p(P.hot, ...a)); });
+  SPR.icWave = mk(p => { p(P.water, 3, 3, 6, 2); p(P.water, 1, 5, 10, 4); p(P.foam, 4, 2, 4, 1); p(P.foam, 8, 3, 2, 2); p(P.white, 9, 4, 1, 1); p(P.dwater, 0, 9, 16, 7); p(P.water, 0, 9, 16, 1); p(P.foam, 2, 12, 3, 1); p(P.foam, 10, 13, 3, 1); });
+  SPR.icWarn = mk(p => { for (let r = 0; r < 13; r++) { const w = r + 2; p(P.yellow, 8 - ((w / 2) | 0), 2 + r, w, 1); } p(P.ink, 7, 6, 2, 5); p(P.ink, 7, 12, 2, 2); });
+  SPR.icTrophy = mk(p => { p(P.yellow, 4, 2, 8, 6); p(P.yellow, 5, 8, 6, 2); p(P.yellow, 7, 10, 2, 2); p(P.orange, 5, 12, 6, 2); p(P.yellow, 2, 3, 2, 3); p(P.yellow, 12, 3, 2, 3); p(P.white, 5, 3, 1, 3); });
+}
+
+/* =====================================================================
+   MODULE: RENDER
+   ===================================================================== */
+let canvas, ctx, S = null;
+const fontCache = {};
+const FONT_CHARS = Object.keys(FONT_SRC), FONT_IDX = {}; FONT_CHARS.forEach((c, i) => (FONT_IDX[c] = i));
+function fontAtlas(col) {
+  if (fontCache[col]) return fontCache[col];
+  return (fontCache[col] = mk(p => FONT_CHARS.forEach((ch, k) => { const s = FONT_SRC[ch]; for (let b = 0; b < 15; b++) if (s[b] === '1') p(col, k * 4 + (b % 3), (b / 3) | 0); }), FONT_CHARS.length * 4, 5));
+}
+function text(str, x, y, col = PAL.white, sc = 1) {
+  str = String(str).toUpperCase(); const a = fontAtlas(col);
+  for (let i = 0; i < str.length; i++) {
+    if (str[i] === ' ') continue; let k = FONT_IDX[str[i]]; if (k === undefined) k = FONT_IDX['?'];
+    ctx.drawImage(a, k * 4, 0, 3, 5, x + i * 4 * sc, y, 3 * sc, 5 * sc);
+  }
+}
+function textS(str, x, y, col, sc = 1) { text(str, x + sc, y + sc, PAL.ink, sc); text(str, x, y, col, sc); }
+const tw = (s, sc = 1) => String(s).length * 4 * sc - sc;
+function wrap(str, maxCh) {
+  const lines = []; let cur = '';
+  for (const w of String(str).split(' ')) { if ((cur + ' ' + w).trim().length > maxCh) { if (cur) lines.push(cur); cur = w; } else cur = (cur + ' ' + w).trim(); }
+  if (cur) lines.push(cur); return lines;
+}
+function rect(x, y, w, h, col) { ctx.fillStyle = col; ctx.fillRect(x, y, w, h); }
+function outline(x, y, w, h, col) { rect(x, y, w, 1, col); rect(x, y + h - 1, w, 1, col); rect(x, y, 1, h, col); rect(x + w - 1, y, 1, h, col); }
+/** Chunky bevelled pixel box */
+function bevel(x, y, w, h, fill, on) {
+  rect(x, y, w, h, PAL.ink); rect(x + 1, y + 1, w - 2, h - 2, on ? PAL.slate : PAL.pale);
+  rect(x + 2, y + 2, w - 3, h - 3, on ? PAL.pale : PAL.slate); rect(x + 2, y + 2, w - 4, h - 4, fill);
+}
+function panel(x, y, w, h, border = PAL.yellow) { rect(x, y, w, h, PAL.ink); rect(x + 1, y + 1, w - 2, h - 2, border); rect(x + 3, y + 3, w - 6, h - 6, PAL.navy); }
+
+function heatColor(h) { return h < 0.35 ? PAL.water : h < 0.5 ? PAL.yellow : h < 0.65 ? PAL.orange : h < 0.8 ? PAL.hot : PAL.red; }
+function valueColor(v) { return v < 0.3 ? PAL.red : v < 0.45 ? PAL.orange : v < 0.6 ? PAL.yellow : v < 0.75 ? PAL.lgreen : PAL.pgreen; }
+function roadMask(x, y) {
+  const r = (a, b) => inB(a, b) && S.tiles[idx(a, b)].b === 'road';
+  return (r(x, y - 1) ? 1 : 0) | (r(x + 1, y) ? 2 : 0) | (r(x, y + 1) ? 4 : 0) | (r(x - 1, y) ? 8 : 0);
+}
+function buildingSprite(t, x, y, f3) {
+  const I = CONFIG.items;
+  switch (t.b) {
+    case 'road': return SPR.road[roadMask(x, y)];
+    case 'res': if (t.ab) return SPR.resAb; if (!t.pop) return SPR.resEmpty; return (t.roof ? SPR.resG : SPR.res)[t.pop < 25 ? 0 : t.pop < 55 ? 1 : 2];
+    case 'com': if (t.ab) return SPR.comAb; if (!t.jobs) return SPR.comEmpty; return (t.roof ? SPR.comG : SPR.com)[t.jobs < 35 ? 0 : 1];
+    case 'wetland': return t.age < I.wetland.mature ? SPR.wetYoung : SPR.wetland[f3];
+    case 'park': return t.age < I.park.mature ? SPR.parkYoung : SPR.park[f3];
+    default: return SPR[t.b];
+  }
+}
+
+function drawMap(now) {
+  const C = CONFIG, T = S.tiles, f3 = Math.floor(now / 380) % 3;
+  const floodFade = clamp(1 - (now - UI.fxFlood) / 7000, 0, 1), heatFade = clamp(1 - (now - UI.fxHeat) / 7000, 0, 1);
+  for (let y = 0; y < C.ROWS; y++) for (let x = 0; x < C.COLS; x++) {
+    const t = T[idx(x, y)], px = C.MAP_X + x * 16, py = C.MAP_Y + y * 16;
+    let spr;
+    switch (t.t) {
+      case 'river': spr = SPR.river[f3]; break; case 'sea': spr = SPR.sea[f3]; break;
+      case 'sand': spr = SPR.sand[t.v % 2]; break; case 'hill': spr = SPR.hill[t.v % 2]; break;
+      case 'flood': spr = SPR.fplain[t.v % 2]; break; default: spr = SPR.grass[t.v];
+    }
+    ctx.drawImage(spr, px, py);
+    if (t.scar && !t.b) ctx.drawImage(SPR.scar, px, py);
+    if (t.b) ctx.drawImage(buildingSprite(t, x, y, f3), px, py);
+    // Overlays
+    if (UI.overlay && !isWaterT(t)) {
+      ctx.globalAlpha = 0.55;
+      if (UI.overlay === 'flood') {
+        if (t.risk > 0.005) { ctx.globalAlpha = Math.min(0.85, 0.3 + t.risk * 1.8); rect(px, py, 16, 16, t.risk > C.flood.damageDepth ? PAL.water : PAL.foam); }
+        else if (t.rawRisk > C.flood.damageDepth) { ctx.globalAlpha = 0.4; rect(px, py, 16, 16, PAL.pgreen); }
+      } else if (UI.overlay === 'heat') rect(px, py, 16, 16, heatColor(t.heat));
+      else rect(px, py, 16, 16, valueColor(t.lv));
+      ctx.globalAlpha = 1;
+    }
+    // Event effects
+    if (floodFade > 0 && t.fx > 0.01) { ctx.globalAlpha = 0.75 * floodFade; ctx.drawImage(SPR.floodFx[f3], px, py); ctx.globalAlpha = 1; }
+    const shimmer = heatFade > 0 && t.hx > C.heat.harmThreshold ? 0.8 * heatFade : t.heat > 0.72 && !isWaterT(t) ? 0.3 : 0;
+    if (shimmer) { ctx.globalAlpha = shimmer; ctx.drawImage(SPR.heatFx[f3], px, py); ctx.globalAlpha = 1; }
+    if (t.dmgYear === S.year - 1) ctx.drawImage(SPR.dmg, px + 11, py + 1);
+    if (DEBUG && UI.dbgValues) { text(Math.round(t.e * 9), px + 1, py + 1, PAL.white); text(Math.round(t.heat * 9), px + 12, py + 10, PAL.orange); if (t.risk > 0.005) text(Math.min(9, Math.round(t.risk * 20)), px + 1, py + 10, PAL.foam); }
+  }
+  // Hover preview & selection
+  if (UI.hover && !UI.popups.length) {
+    const [hx, hy] = UI.hover, it = CONFIG.items[UI.tool];
+    const ok = canPlace(S, UI.tool, hx, hy).ok;
+    const r = it.radius || (UI.tool === 'cool' ? it.radius : 0);
+    if (r && UI.tool !== 'inspect') { ctx.globalAlpha = 0.6; outline(C.MAP_X + (hx - r) * 16, C.MAP_Y + (hy - r) * 16, (2 * r + 1) * 16, (2 * r + 1) * 16, PAL.yellow); ctx.globalAlpha = 1; }
+    outline(C.MAP_X + hx * 16, C.MAP_Y + hy * 16, 16, 16, ok ? PAL.white : PAL.red);
+  }
+  if (UI.inspect != null && Math.floor(now / 400) % 2) { const i = UI.inspect; outline(C.MAP_X + (i % C.COLS) * 16 - 1, C.MAP_Y + ((i / C.COLS) | 0) * 16 - 1, 18, 18, PAL.yellow); }
+  // Overlay legend
+  if (UI.overlay) {
+    const lx = C.MAP_X + C.COLS * 16 - 106, ly = C.MAP_Y + 3;
+    rect(lx, ly, 103, 20, PAL.ink);
+    const L = UI.overlay === 'flood' ? [['FLOOD RISK (DESIGN FLOOD)', null], ['DEEP', PAL.water], ['SHALLOW', PAL.foam], ['PROTECTED', PAL.pgreen]]
+      : UI.overlay === 'heat' ? [['HEAT ISLAND SCORE', null], ['COOL', PAL.water], ['WARM', PAL.orange], ['HOT', PAL.red]]
+      : [['LAND VALUE', null], ['LOW', PAL.red], ['MID', PAL.yellow], ['HIGH', PAL.pgreen]];
+    text(L[0][0], lx + 3, ly + 3, PAL.white);
+    let ox = lx + 3; for (let k = 1; k < 4; k++) { rect(ox, ly + 12, 5, 5, L[k][1]); text(L[k][0], ox + 7, ly + 12, PAL.pale); ox += 10 + tw(L[k][0]) + 4; }
+  }
+}
+
+function drawHUD() {
+  const W = CONFIG.W;
+  rect(0, 0, W, 28, PAL.navy); rect(0, 26, W, 1, PAL.slate); rect(0, 27, W, 1, PAL.ink);
+  textS('ADAPTASIA', 6, 5, PAL.yellow, 2); text('BETA - CLIMATE CITY', 6, 18, PAL.gray);
+  const good = PAL.lgreen, bad = PAL.red, mid = PAL.white;
+  const row = (items, y) => { let x = 124; items.forEach(([l, v, c]) => { text(l, x, y, PAL.gray); x += tw(l) + 5; text(v, x, y, c); x += tw(v) + 12; }); };
+  row([['BUDGET', '$' + fmt(S.budget), S.budget < 0 ? bad : mid], ['POPULATION', fmt(S.pop) + ' / ' + fmt(CONFIG.winPop), S.pop >= CONFIG.winPop ? good : mid],
+       ['JOBS', fmt(S.jobsCap), S.jobFactor < 0.8 ? PAL.orange : mid], ['YEAR', Math.min(S.year, CONFIG.maxYears) + ' / ' + CONFIG.maxYears, S.year > 25 ? PAL.orange : mid]], 6);
+  row([['HAPPINESS', Math.round(S.happiness) + '%', S.happiness < 30 ? bad : S.happiness >= 60 ? good : mid],
+       ['RESILIENCE', S.resilience + ' / 100', S.resilience >= CONFIG.winResilience ? good : S.resilience < 50 ? bad : mid],
+       ['RECREATION', fmt(S.recreation), mid], ['ATTRACTIVENESS', S.attract, S.attract >= 55 ? good : S.attract < 35 ? bad : mid]], 16);
+}
+
+function itemEffects(id) {
+  const it = CONFIG.items[id], out = [];
+  if (id === 'levee') out.push(`BLOCKS FLOODS UP TO ${it.flood.toFixed(2)} DEEP, RADIUS ${it.radius}`);
+  else if (it.flood) out.push(`FLOOD -${it.flood.toFixed(2)}` + (it.radius ? ` RADIUS ${it.radius}` : ' ON TILE'));
+  if (id === 'cool') out.push(`HEAT HARM -${it.harmCut * 100}% RADIUS ${it.radius}`);
+  if (it.heatRed) out.push(it.heatRed > 0 ? `COOLING +${it.heatRed.toFixed(2)}` : `ADDS HEAT +${(-it.heatRed).toFixed(2)}`);
+  if (it.rec || it.attr) out.push(`RECREATION +${it.rec || 0}  ATTRACT ${it.attr >= 0 ? '+' : ''}${it.attr || 0}`);
+  if (it.mature) out.push(`FULL EFFECT AFTER ${it.mature} YEAR${it.mature > 1 ? 'S' : ''}`);
+  if (it.fail) out.push(`${Math.round(it.fail * 100)}% FAIL CHANCE IN EXTREME FLOODS`);
+  if (id === 'res') out.push(`UP TO ~${it.cap} RESIDENTS (MORE WITH LAND VALUE)`);
+  if (id === 'com') out.push(`UP TO ~${it.jobs} JOBS`);
+  return out;
+}
+
+function drawPanel(now) {
+  const H = CONFIG.H;
+  rect(0, 28, 120, H - 28, PAL.navy); rect(119, 28, 1, H - 28, PAL.ink);
+  [['TOOLS', 30, PAL.pale], ['DEVELOP', 66, PAL.yellow], ['GRAY INFRASTRUCTURE', 102, PAL.gray], ['NATURE-BASED', 138, PAL.lgreen], ['OVERLAYS', 176, PAL.foam]]
+    .forEach(([l, y, c]) => text(l, 4, y, c));
+  const iconOf = { inspect: SPR.icInspect, demolish: SPR.icDemolish, road: SPR.road[10], res: SPR.res[0], com: SPR.com[0], levee: SPR.levee, drain: SPR.drain,
+    cool: SPR.cool, wetland: SPR.wetland[0], park: SPR.park[0], roof: SPR.resG[2], swale: SPR.swale };
+  UI.buttons.forEach(b => {
+    const hov = UI.hoverBtn === b;
+    if (b.kind === 'tool') {
+      const sel = UI.tool === b.id; bevel(b.x, b.y, b.w, b.h, sel ? PAL.yellow : hov ? PAL.steel : PAL.slate, sel);
+      ctx.drawImage(iconOf[b.id], b.x + 4, b.y + 4);
+      if (CONFIG.items[b.id].cost > S.budget) { ctx.globalAlpha = 0.55; rect(b.x + 4, b.y + 4, 16, 16, PAL.ink); ctx.globalAlpha = 1; }
+    } else {
+      let label = b.label, on = false, fill = hov ? PAL.steel : PAL.slate, tc = PAL.white;
+      if (b.kind === 'overlay') { on = UI.overlay === b.id; if (on) { fill = PAL.foam; tc = PAL.ink; } }
+      if (b.id === 'end') { fill = S.over ? PAL.steel : hov ? PAL.hot : PAL.red; }
+      if (b.id === 'speed') label = UI.auto ? `SPEED: AUTO (1 YR / ${CONFIG.autoSeconds}S)` : 'SPEED: MANUAL';
+      if (b.kind === 'debug') fill = PAL.purple;
+      bevel(b.x, b.y, b.w, b.h, fill, on);
+      const sc = b.id === 'end' ? 2 : 1;
+      if (b.id === 'end' && UI.auto) { const prog = clamp((now - UI.lastAuto) / (CONFIG.autoSeconds * 1000), 0, 1); rect(b.x + 3, b.y + b.h - 4, (b.w - 6) * prog, 1, PAL.yellow); }
+      textS(label, b.x + ((b.w - tw(label, sc)) >> 1), b.y + ((b.h - 5 * sc) >> 1), tc, sc);
+    }
+  });
+  // Info panel
+  const x = 2, y = 202, w = 116, h = 150; rect(x, y, w, h, PAL.ink); rect(x + 1, y + 1, w - 2, h - 2, PAL.slate); rect(x + 2, y + 2, w - 4, h - 4, PAL.navy);
+  const lines = infoLines(); let ly = y + 5;
+  lines.forEach(([s, c]) => wrap(s, 27).forEach(l => { if (ly < y + h - 7) { text(l, x + 4, ly, c); ly += 7; } }));
+}
+function infoLines() {
+  const C = CONFIG, P = PAL, L = [];
+  if (UI.inspect != null) {
+    const t = S.tiles[UI.inspect], x = UI.inspect % C.COLS, y = (UI.inspect / C.COLS) | 0;
+    const tn = { land: 'LAND', river: 'RIVER', sea: 'SEA', sand: 'COASTLINE', flood: 'FLOODPLAIN', hill: 'HILL' }[t.t];
+    L.push([`TILE ${x},${y}: ${tn}`, P.yellow]);
+    if (isWaterT(t)) { L.push(['WATER. FLOODS START HERE.', P.foam]); return L; }
+    if (t.b) {
+      const it = C.items[t.b]; L.push([it.name + (t.ab ? ' (ABANDONED)' : '') + (t.roof ? ' + GREEN ROOF' : ''), P.white]);
+      if (t.b === 'res') L.push([`RESIDENTS: ${t.pop}`, P.white]);
+      if (t.b === 'com') L.push([`JOBS: ${t.jobs}`, P.white]);
+      if (it.mature) L.push([`MATURITY: ${Math.round(eff(it, t.age) * 100)}%`, P.lgreen]);
+      if ((t.b === 'res' || t.b === 'com') && !roadAccessMap(S)[UI.inspect]) L.push(['NO ROAD WITHIN 2 TILES!', P.red]);
+    }
+    L.push([`ELEVATION: ${t.e.toFixed(2)}`, P.pale]);
+    L.push([`HEAT SCORE: ${t.heat.toFixed(2)}${t.cooled ? ' (COOLED)' : ''}`, t.heat > 0.6 ? P.orange : P.pale]);
+    L.push([`LAND VALUE: ${t.lv.toFixed(2)}`, P.pale]);
+    L.push([`FLOOD DEPTH IN DESIGN FLOOD: ${t.risk.toFixed(2)}`, t.risk > C.flood.damageDepth ? P.water : P.pale]);
+    if (t.rawRisk > C.flood.damageDepth && t.risk <= C.flood.damageDepth) L.push(['PROTECTED BY YOUR DEFENSES', P.pgreen]);
+    if (t.fh.length) L.push([`FLOODED ${t.fh.length}X IN LAST 3 YEARS`, P.red]);
+    L.push(['ESC: BACK TO TOOL INFO', P.gray]);
+    return L;
+  }
+  const it = C.items[UI.tool];
+  L.push([it.name.toUpperCase(), it.cat === 'gray' ? P.gray : it.cat === 'nature' ? P.lgreen : P.yellow]);
+  if (it.cost) L.push([`COST $${fmt(it.cost)}` + (it.upkeep ? `  UPKEEP $${it.upkeep}/YR` : ''), P.white]);
+  L.push([it.desc, P.pale]);
+  itemEffects(UI.tool).forEach(e => L.push([e, P.foam]));
+  if (UI.tool === 'inspect') { L.push(['', P.white]); L.push(['TIP: SPACE = END YEAR. HOVER A TOOL FOR A FACT. DRAG TO PAINT ROADS AND ZONES.', P.gray]); }
+  return L;
+}
+
+function drawBottom(now) {
+  const C = CONFIG, x0 = C.MAP_X, y0 = C.MAP_Y + C.ROWS * 16 + 2, fc = S.forecast;
+  rect(120, y0 - 2, C.W - 120, C.H - y0 + 2, PAL.navy); rect(120, y0 - 2, C.W - 120, 1, PAL.ink);
+  text('FORECAST FOR THIS YEAR:', x0, y0 + 2, PAL.pale);
+  const bar = (x, frac, col) => { rect(x, y0 + 1, 52, 7, PAL.ink); rect(x + 1, y0 + 2, 50 * frac, 5, col); };
+  let x = x0 + 96; text('FLOOD', x, y0 + 2, PAL.foam); bar(x + 22, fc.fc, PAL.water); text(`${Math.round(fc.fc * 100)}% ${floodLabel(fc)}`, x + 78, y0 + 2, fc.extreme ? PAL.red : PAL.white);
+  x += 150; text('HEAT', x, y0 + 2, PAL.orange); bar(x + 18, fc.hc, PAL.hot); text(`${Math.round(fc.hc * 100)}% ${heatLabel(fc)}`, x + 74, y0 + 2, heatLabel(fc) === 'SEVERE' ? PAL.red : PAL.white);
+  // Hover info line
+  let info = '';
+  if (UI.hover) {
+    const [hx, hy] = UI.hover, t = S.tiles[idx(hx, hy)];
+    const tn = { land: 'LAND', river: 'RIVER', sea: 'SEA', sand: 'COAST', flood: 'FLOODPLAIN', hill: 'HILL' }[t.t];
+    info = `${hx},${hy} ${tn}` + (t.b ? ' - ' + CONFIG.items[t.b].name + (t.b === 'res' ? ` (${t.pop})` : '') : '') +
+      (isWaterT(t) ? '' : `  ELEV ${t.e.toFixed(2)}  HEAT ${t.heat.toFixed(2)}  VALUE ${t.lv.toFixed(2)}  RISK ${t.risk.toFixed(2)}`);
+    if (UI.tool !== 'inspect') { const r = canPlace(S, UI.tool, hx, hy); info += r.ok ? `  BUILD $${fmt(r.cost)}` : '  ' + r.reason; }
+  }
+  text(info.slice(0, 128), x0, y0 + 13, PAL.white);
+  if (now < UI.msgUntil) text(UI.msg.slice(0, 128), x0, y0 + 23, PAL.yellow);
+}
+
+function drawTooltip() {
+  const b = UI.hoverBtn; if (!b || b.kind !== 'tool' || UI.popups.length) return;
+  const it = CONFIG.items[b.id], lines = [];
+  lines.push([it.name.toUpperCase() + (it.cost ? `  $${fmt(it.cost)}` + (it.upkeep ? ` (+$${it.upkeep}/YR)` : '') : ''), PAL.yellow]);
+  wrap(it.desc, 42).forEach(l => lines.push([l, PAL.white]));
+  itemEffects(b.id).forEach(e => lines.push([e, PAL.foam]));
+  if (it.fact) wrap('FACT: ' + it.fact, 42).forEach(l => lines.push([l, PAL.pgreen]));
+  const w = 178, h = lines.length * 7 + 8, x = b.x + b.w + 4, y = clamp(b.y, 30, CONFIG.H - h - 2);
+  rect(x, y, w, h, PAL.ink); outline(x, y, w, h, PAL.yellow);
+  lines.forEach(([s, c], k) => text(s, x + 4, y + 4 + k * 7, c));
+}
+
+function drawPopup() {
+  const p = UI.popups[0]; if (!p) return; const C = CONFIG;
+  ctx.globalAlpha = 0.5; rect(0, 0, C.W, C.H, PAL.ink); ctx.globalAlpha = 1;
+  const w = p.w || 300, iconW = p.icon ? 42 : 0, maxCh = Math.floor((w - 20 - iconW) / 4);
+  const body = [];
+  (p.lines || []).forEach(l => { if (l === '') body.push(['', null]); else wrap(l, maxCh).forEach(s => body.push([s, l.startsWith('*') ? PAL.yellow : PAL.white])); });
+  if (p.fact) { body.push(['', null]); wrap('DID YOU KNOW? ' + p.fact, maxCh).forEach(s => body.push([s, PAL.pgreen])); }
+  const barsH = p.bars ? p.bars.length * 11 + 4 : 0;
+  const h = Math.max(70, 36 + body.length * 8 + barsH + 24), x = ((C.W - w) / 2) | 0, y = Math.max(4, ((C.H - h) / 2) | 0);
+  panel(x, y, w, h, p.border || PAL.yellow);
+  if (p.icon) { rect(x + 8, y + 8, 36, 36, PAL.ink); ctx.drawImage(p.icon, x + 10, y + 10, 32, 32); }
+  const tx = x + 12 + iconW; textS(p.title, tx, y + 10, PAL.yellow, 2);
+  let ly = y + 28; body.forEach(([s, c]) => { if (c) text(s.replace(/^\*/, ''), tx, ly, c); ly += 8; });
+  if (p.bars) { ly += 2; const max = Math.max(1, ...p.bars.map(b => b[1])); p.bars.forEach(([l, v, c]) => { text(l, tx, ly + 1, PAL.pale); rect(tx + 60, ly, 120, 7, PAL.ink); rect(tx + 61, ly + 1, 118 * v / max, 5, c); text('$' + fmt(v), tx + 186, ly + 1, PAL.white); ly += 11; }); }
+  UI.popupBtns = []; let bx = x + w - 10;
+  (p.buttons || [{ label: 'OK', act: () => {} }]).slice().reverse().forEach(b => {
+    const bw = tw(b.label) + 14; bx -= bw; const by = y + h - 19;
+    const hov = UI.mouse.x >= bx && UI.mouse.x < bx + bw && UI.mouse.y >= by && UI.mouse.y < by + 13;
+    bevel(bx, by, bw, 13, hov ? PAL.hot : PAL.red); textS(b.label, bx + 7, by + 4, PAL.white);
+    UI.popupBtns.push({ x: bx, y: by, w: bw, h: 13, act: b.act }); bx -= 6;
+  });
+}
+
+function draw(now) {
+  ctx.imageSmoothingEnabled = false;
+  rect(0, 0, CONFIG.W, CONFIG.H, PAL.ink);
+  drawMap(now); drawHUD(); drawPanel(now); drawBottom(now); drawTooltip(); drawPopup();
+}
+
+/* =====================================================================
+   MODULE: UI  (input, buttons, popups, tutorial, save/load, report)
+   ===================================================================== */
+const UI = { tool: 'inspect', overlay: null, auto: false, lastAuto: 0, hover: null, hoverBtn: null, popups: [], popupBtns: [],
+  inspect: null, dbgValues: true, msg: '', msgUntil: 0, mouse: { x: -1, y: -1, down: false }, lastPaint: -1, fxFlood: -1e9, fxHeat: -1e9, buttons: [] };
+const SAVE_KEY = 'adaptasia_save_v1', TUT_KEY = 'adaptasia_tutorial_seen';
+
+function buildButtons() {
+  const B = [], row = (ids, y) => ids.forEach((id, k) => B.push({ x: 4 + k * 28, y, w: 24, h: 24, kind: 'tool', id }));
+  row(['inspect', 'demolish'], 38); row(['road', 'res', 'com'], 74); row(['levee', 'drain', 'cool'], 110); row(['wetland', 'park', 'roof', 'swale'], 146);
+  ['flood', 'heat', 'value'].forEach((id, k) => B.push({ x: 4 + k * 38, y: 184, w: 36, h: 13, kind: 'overlay', id, label: id.toUpperCase() }));
+  B.push({ x: 4, y: 356, w: 112, h: 20, kind: 'action', id: 'end', label: 'END YEAR' });
+  B.push({ x: 4, y: 380, w: 112, h: 12, kind: 'action', id: 'speed', label: '' });
+  ['SAVE', 'LOAD', 'NEW', 'HELP'].forEach((l, k) => B.push({ x: 4 + k * 28, y: 396, w: 26, h: 12, kind: 'action', id: l.toLowerCase(), label: l }));
+  if (DEBUG) ['FLOOD!', 'HEAT!', '+10K'].forEach((l, k) => B.push({ x: 4 + k * 38, y: 412, w: 36, h: 12, kind: 'debug', id: ['dflood', 'dheat', 'dmoney'][k], label: l }));
+  UI.buttons = B;
+}
+function flash(msg, ms = 3500) { UI.msg = msg; UI.msgUntil = performance.now() + ms; }
+function btnAt(x, y) { return UI.buttons.find(b => x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h) || null; }
+function tileAt(x, y) {
+  const C = CONFIG, tx = Math.floor((x - C.MAP_X) / 16), ty = Math.floor((y - C.MAP_Y) / 16);
+  return inB(tx, ty) && x >= C.MAP_X && y >= C.MAP_Y ? [tx, ty] : null;
+}
+function tryPlace(tx, ty) {
+  if (UI.tool === 'inspect') { UI.inspect = idx(tx, ty); return; }
+  const r = place(S, UI.tool, tx, ty);
+  if (r.ok) flash(`${CONFIG.items[UI.tool].name.toUpperCase()}: -$${fmt(r.cost)}`, 1500);
+  else flash(r.reason, 2500);
+}
+function onButton(b) {
+  if (b.kind === 'tool') { UI.tool = b.id; UI.inspect = null; return; }
+  if (b.kind === 'overlay') { UI.overlay = UI.overlay === b.id ? null : b.id; return; }
+  switch (b.id) {
+    case 'end': doEndYear(); break;
+    case 'speed': UI.auto = !UI.auto; UI.lastAuto = performance.now(); break;
+    case 'save': try { localStorage.setItem(SAVE_KEY, JSON.stringify(S)); flash('GAME SAVED.'); } catch (e) { flash('SAVE FAILED (STORAGE BLOCKED?)'); } break;
+    case 'load': try { const d = localStorage.getItem(SAVE_KEY); if (!d) { flash('NO SAVED GAME FOUND.'); break; } S = JSON.parse(d); recomputeAll(S); UI.inspect = null; flash('GAME LOADED.'); } catch (e) { flash('LOAD FAILED.'); } break;
+    case 'new': UI.popups.push({ title: 'NEW GAME?', icon: SPR.icWarn, lines: ['Start over on a new map? Unsaved progress will be lost.'],
+      buttons: [{ label: 'CANCEL', act: () => {} }, { label: 'NEW MAP', act: () => { S = newState(); UI.inspect = null; UI.auto = false; } }] }); break;
+    case 'help': showTutorial(); break;
+    case 'dflood': { const r = applyFlood(S, S.forecast.sev * 1.3, false); UI.fxFlood = performance.now(); UI.popups.push(floodPopup(r, true)); break; }
+    case 'dheat': { const r = applyHeat(S, S.forecast.inten * 1.2); UI.fxHeat = performance.now(); UI.popups.push(heatPopup(r, true)); break; }
+    case 'dmoney': S.budget += 10000; flash('DEBUG: +$10,000'); break;
+  }
+}
+function floodPopup(r, dbg) {
+  const fact = r.failed ? FACTS.levee : r.extreme ? FACTS.saturate : S.tiles.some(t => t.b === 'wetland') ? FACTS.wetland
+    : [FACTS.floodplain, FACTS.downpours, FACTS.mitigation, FACTS.neighbors, FACTS.drain, FACTS.mature][(Math.random() * 6) | 0];
+  const L = [`The river and sea rose to level ${r.level.toFixed(2)}.` + (r.extreme ? ' An extreme event!' : '')];
+  L.push(r.hit ? `${r.hit} buildings were damaged. Repairs cost $${fmt(r.dmg)}.` : 'No buildings were damaged.');
+  if (r.avoided > 0) L.push(`*Your defenses avoided $${fmt(r.avoided)} in damage.`);
+  if (r.popLost) L.push(`${fmt(r.popLost)} residents were displaced.`);
+  if (r.aband) L.push(`${r.aband} buildings flooded twice in 3 years and were abandoned.`);
+  if (r.failed) L.push(`*${r.failed} levee(s) were overtopped or breached and destroyed!`);
+  if (r.clogged) L.push(`${r.clogged} storm drain(s) clogged with debris.`);
+  return { title: (dbg ? 'DEBUG ' : '') + (r.extreme ? 'EXTREME FLOOD!' : 'FLOOD!'), icon: SPR.icWave, border: PAL.water, lines: L, fact };
+}
+function heatPopup(r, dbg) {
+  const fact = r.cooledSaved > 0 ? FACTS.cooling : [FACTS.heatDeadly, FACTS.island, FACTS.canopy, FACTS.inequity, FACTS.greenroof][(Math.random() * 5) | 0];
+  const L = [`A heat wave (intensity ${r.inten.toFixed(2)}) baked the city.`];
+  L.push(r.lost ? `${fmt(r.lost)} residents fell ill or moved away from the ${r.hot} hottest blocks.` : 'Your neighborhoods stayed cool enough. No one left.');
+  if (r.cooledSaved) L.push(`*Cooling centers protected about ${fmt(r.cooledSaved)} people.`);
+  if (r.lost) L.push('Tip: check the HEAT overlay. Trees, wetlands and green roofs lower it.');
+  return { title: (dbg ? 'DEBUG ' : '') + 'HEAT WAVE!', icon: SPR.icSun, border: PAL.hot, lines: L, fact };
+}
+function reportPopup() {
+  const s = S.stats, R = { win: 'YOU WIN!', bankrupt: 'BANKRUPT', unhappy: 'RESIDENTS REVOLT', time: "TIME'S UP" }[S.result];
+  const why = { win: `You reached ${fmt(S.pop)} people with resilience ${S.resilience}.`, bankrupt: 'The budget stayed in the red too long.',
+    unhappy: 'Happiness stayed below 20% for 3 years.', time: `30 years passed. Goal: ${fmt(CONFIG.winPop)} people, resilience ${CONFIG.winResilience}+, budget $0+.` }[S.result];
+  const les = lessons(S);
+  return { title: R, icon: S.result === 'win' ? SPR.icTrophy : SPR.icWarn, w: 420, border: S.result === 'win' ? PAL.lgreen : PAL.red,
+    lines: [why, `YEAR ${S.year - 1}  POP ${fmt(S.pop)}  BUDGET $${fmt(S.budget)}  HAPPY ${Math.round(S.happiness)}%  RESILIENCE ${S.resilience}`,
+      `FLOODS ${s.floods}  HEAT WAVES ${s.heatwaves}  LEVEE FAILURES ${s.leveeFails}  ABANDONED ${s.abandoned}`,
+      `DAMAGE TAKEN $${fmt(s.damage)}  DAMAGE AVOIDED $${fmt(s.avoided)}`, '', '*LESSONS LEARNED', ...les.map((l, k) => `${k + 1}. ${l}`), '', 'SPENDING (BUILD + UPKEEP):'],
+    bars: [['GRAY', Math.round(s.gray), PAL.gray], ['NATURE', Math.round(s.nbs), PAL.lgreen], ['DEVELOPMENT', Math.round(s.dev), PAL.yellow]],
+    buttons: [{ label: 'KEEP LOOKING', act: () => {} }, { label: 'NEW GAME', act: () => { S = newState(); UI.inspect = null; } }] };
+}
+function doEndYear() {
+  if (!S || S.over || UI.popups.length) return;
+  const rep = endYear(S); if (!rep) return;
+  UI.lastAuto = performance.now();
+  flash(`YEAR ${rep.year} DONE: TAXES +$${fmt(rep.taxes)}, UPKEEP -$${fmt(rep.upkeep)}.` + (!rep.flood && !rep.heat ? ' A CALM YEAR.' : ''), 7000);
+  if (rep.flood) { UI.fxFlood = performance.now(); UI.popups.push(floodPopup(rep.flood)); }
+  if (rep.heat) { UI.fxHeat = performance.now(); UI.popups.push(heatPopup(rep.heat)); }
+  if (rep.warnBankrupt) UI.popups.push({ title: 'IN THE RED', icon: SPR.icWarn, lines: [`Your budget is below zero (year ${S.redYears} of ${CONFIG.bankruptYears}). Stay in the red ${CONFIG.bankruptYears} years running and the city goes bankrupt.`, 'Upkeep adds up: check what you can afford.'] });
+  if (rep.warnHappy) UI.popups.push({ title: 'UNHAPPY CITY', icon: SPR.icWarn, lines: [`Happiness has been below 20% for ${S.lowHappy} year(s). Three in a row and residents revolt.`, 'Parks, jobs, cooler streets and fewer disasters help.'] });
+  if (S.over) { UI.auto = false; UI.popups.push(reportPopup()); }
+}
+function showTutorial() {
+  const pages = [
+    { title: 'WELCOME!', icon: SPR.park[0], lines: ['You are the planner of a young river city. Grow it to 5,000 people within 30 years while keeping it safe from floods and heat.', '',
+      '*WIN: population 5,000+, resilience 70+, and budget $0 or more.', `LOSE: in the red ${CONFIG.bankruptYears} years running, or happiness under 20% for 3 years in a row.`] },
+    { title: 'BUILD', icon: SPR.res[1], lines: ['Lay ROADS first. Residential and commercial zones only grow within 2 tiles of a road. Drag to paint.', '',
+      'Homes pay taxes; shops add jobs. Keep jobs and homes in balance.', '', 'When you are done, press END YEAR (or SPACE). Switch SPEED to AUTO to play a year every 5 seconds.'] },
+    { title: 'HAZARDS', icon: SPR.icWave, lines: ['Each year may bring a FLOOD from the river and coast, or a citywide HEAT WAVE. Both grow more likely and stronger over time.', '',
+      'Check the FORECAST at the bottom, and use the FLOOD, HEAT and VALUE overlays to see where risk is.', '', 'Low tiles near water flood first. A building that floods twice in 3 years is abandoned.'] },
+    { title: 'GRAY OR GREEN?', icon: SPR.wetland[0], lines: ['GRAY (levees, drains, cooling centers): works at once and is reliable, but costly, adds no amenities, and can fail in extreme floods.', '',
+      'NATURE (wetlands, parks, green roofs, bioswales): cheaper, matures over years, adds cooling, recreation and land value, but has limits.', '', '*The best cities usually mix both. Hover over any tool to learn more.'] },
+  ];
+  pages.forEach((pg, k) => { pg.title = `${k + 1}/4 ${pg.title}`; pg.buttons = k < 3 ? [{ label: 'SKIP', act: () => { UI.popups = UI.popups.filter(p => !p.tut); } }, { label: 'NEXT', act: () => {} }] : [{ label: "LET'S BUILD!", act: () => {} }]; pg.tut = true; pg.w = 320; });
+  UI.popups.unshift(...pages);
+  try { localStorage.setItem(TUT_KEY, '1'); } catch (e) {}
+}
+function toLocal(e) { const r = canvas.getBoundingClientRect(); return { x: ((e.clientX - r.left) / r.width) * CONFIG.W, y: ((e.clientY - r.top) / r.height) * CONFIG.H }; }
+function setupInput() {
+  canvas.addEventListener('pointerdown', e => {
+    const m = toLocal(e); UI.mouse = { ...m, down: true };
+    if (UI.popups.length) {
+      const b = UI.popupBtns.find(b => m.x >= b.x && m.x < b.x + b.w && m.y >= b.y && m.y < b.y + b.h);
+      if (b) { UI.popups.shift(); b.act(); } return;
+    }
+    const btn = btnAt(m.x, m.y); if (btn) { onButton(btn); return; }
+    const t = tileAt(m.x, m.y); if (t) { tryPlace(t[0], t[1]); UI.lastPaint = idx(t[0], t[1]); }
+  });
+  canvas.addEventListener('pointermove', e => {
+    const m = toLocal(e); UI.mouse.x = m.x; UI.mouse.y = m.y;
+    UI.hoverBtn = btnAt(m.x, m.y); UI.hover = tileAt(m.x, m.y);
+    if (UI.mouse.down && UI.hover && !UI.popups.length && UI.tool !== 'inspect') {
+      const i = idx(UI.hover[0], UI.hover[1]); if (i !== UI.lastPaint) { UI.lastPaint = i; tryPlace(UI.hover[0], UI.hover[1]); }
+    }
+  });
+  window.addEventListener('pointerup', () => { UI.mouse.down = false; UI.lastPaint = -1; });
+  canvas.addEventListener('pointerleave', () => { UI.hover = null; UI.hoverBtn = null; });
+  window.addEventListener('keydown', e => {
+    if (e.code === 'Space') { e.preventDefault(); if (UI.popups.length) UI.popups.shift(); else doEndYear(); }
+    if (e.code === 'Escape') { UI.inspect = null; UI.tool = 'inspect'; }
+    if (DEBUG && !UI.popups.length && e.key === 'f') onButton({ id: 'dflood' });
+    if (DEBUG && !UI.popups.length && e.key === 'h') onButton({ id: 'dheat' });
+    if (DEBUG && e.key === 'v') UI.dbgValues = !UI.dbgValues; // toggle tile value labels
+  });
+}
+function resize() {
+  const C = CONFIG, s = Math.min(window.innerWidth / C.W, window.innerHeight / C.H);
+  const scale = s >= 1 ? Math.floor(s) : s; // integer scaling for pixel-perfect output
+  canvas.style.width = C.W * scale + 'px'; canvas.style.height = C.H * scale + 'px';
+}
+
+/* =====================================================================
+   MODULE: BOOT
+   ===================================================================== */
+function boot() {
+  canvas = document.getElementById('game'); canvas.width = CONFIG.W; canvas.height = CONFIG.H;
+  ctx = canvas.getContext('2d'); ctx.imageSmoothingEnabled = false;
+  buildSprites(); buildButtons(); setupInput(); resize(); window.addEventListener('resize', resize);
+  S = newState();
+  let seen = false; try { seen = !!localStorage.getItem(TUT_KEY); } catch (e) {}
+  if (!seen) showTutorial(); else flash('WELCOME BACK. PRESS HELP FOR THE TUTORIAL.', 5000);
+  const loop = now => {
+    if (UI.auto && !UI.popups.length && S && !S.over && now - UI.lastAuto > CONFIG.autoSeconds * 1000) doEndYear();
+    draw(now); requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
+}
+if (typeof document !== 'undefined' && document.getElementById('game')) boot();
+if (typeof module !== 'undefined') module.exports = { CONFIG, newState, place, canPlace, endYear, recomputeAll, idx, inB, isWaterT, forRadius, levelFor, designLevel, lessons, roadAccessMap };
+
+/* =====================================================================
+   FUTURE FEATURES (out of scope for this beta)
+   - Drought (water supply, park irrigation stress)
+   - Wildfire at the wildland-urban edge
+   - Sea-level rise raising the coastal baseline each decade
+   - Policy menus (zoning rules, buyouts, building codes, insurance, tax rates)
+   - Multiplayer / regional cooperation between neighboring cities
+   - Sound and music beyond simple beeps
+   - Costs and effect sizes calibrated to real urban-climate data
+   ===================================================================== */
+</script>
+</body>
+</html>

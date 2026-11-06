@@ -1,0 +1,36 @@
+{
+  "name": "adaptasia",
+  "version": "0.1.0-beta",
+  "description": "An educational climate-adaptation city builder running entirely in the browser with zero external dependencies.",
+  "main": "index.html",
+  "scripts": {
+    "start": "python -m http.server 8000 || npx serve .",
+    "test": "node tests/test_simulation.js || python tests/test_integrity.py",
+    "test:node": "node tests/test_simulation.js",
+    "test:python": "python tests/test_integrity.py"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adaptasia/adaptasia.git"
+  },
+  "keywords": [
+    "climate-change",
+    "climate-adaptation",
+    "city-builder",
+    "serious-game",
+    "educational-game",
+    "html5-canvas",
+    "vanilla-js",
+    "pixel-art",
+    "simulation",
+    "nature-based-solutions",
+    "urban-heat-island",
+    "flood-risk"
+  ],
+  "author": "Adaptasia Contributors",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/adaptasia/adaptasia/issues"
+  },
+  "homepage": "https://github.com/adaptasia/adaptasia#readme"
+}

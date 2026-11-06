@@ -1,0 +1,32 @@
+name: CI & Simulation Validation
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run Python Repository & Integrity Tests
+        run: |
+          python tests/test_integrity.py
+
+      - name: Run Node Simulation Unit Tests
+        run: |
+          node tests/test_simulation.js
